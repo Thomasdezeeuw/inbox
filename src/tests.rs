@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use crate::{
     has_status, new_small, receiver_pos, slot_status, Channel, Inner, Manager, Receiver, SendValue,
     Sender, WakerList, ALL_STATUSES_MASK, EMPTY, FILLED, MARK_EMPTIED, MARK_NEXT_POS, MARK_READING,
-    POS_BITS, READING, SMALL_CAP, TAKEN,
+    MAX_CAP, POS_BITS, READING, SMALL_CAP, TAKEN,
 };
 
 fn test_channel() -> Box<Channel<usize>> {
@@ -36,7 +36,7 @@ fn assertions() {
     // correctly.
 
     // Enough bits for the statuses of the slots.
-    assert_eq!(2_usize.pow(POS_BITS as u32), SMALL_CAP);
+    assert!(2_usize.pow(POS_BITS as u32) >= MAX_CAP);
 
     // Status are different.
     assert_ne!(EMPTY, TAKEN);
@@ -151,28 +151,34 @@ fn test_has_status() {
 
 #[test]
 fn test_receiver_pos() {
+    #[rustfmt::skip]
     let tests = &[
-        (0b000_1110010011100100, 0),
-        (0b001_1110010011100100, 1),
-        (0b010_1110010011100100, 2),
-        (0b011_1110010011100100, 3),
-        (0b100_1110010011100100, 4),
-        (0b101_1110010011100100, 5),
-        (0b110_1110010011100100, 6),
-        (0b111_1110010011100100, 7),
+        (0b0000000000000000000000000000000000000000000000000000000000000000, 0),
+        (0b0000010000000000000000000000000000000000000000000000000000000000, 1),
+        (0b0000100000000000000000000000000000000000000000000000000000000000, 2),
+        (0b0000110000000000000000000000000000000000000000000000000000000000, 3),
+        (0b0001000000000000000000000000000000000000000000000000000000000000, 4),
+        (0b0001010000000000000000000000000000000000000000000000000000000000, 5),
+        (0b0001100000000000000000000000000000000000000000000000000000000000, 6),
+        (0b0001110000000000000000000000000000000000000000000000000000000000, 7),
         // Additional bits are ignored.
-        (0b1_000_1110010011100100, 0),
-        (0b1_001_1110010011100100, 1),
-        (0b1_010_1110010011100100, 2),
-        (0b1_011_1110010011100100, 3),
-        (0b1_100_1110010011100100, 4),
-        (0b1_101_1110010011100100, 5),
-        (0b1_110_1110010011100100, 6),
-        (0b1_111_1110010011100100, 7),
+        (0b0000000000000000000000000000000000000000000000000000000000000000, 0),
+        (0b1000010000000000000000000000000000000000000000000000000000000000, 1),
+        (0b1000100000000000000000000000000000000000000000000000000000000000, 2),
+        (0b0100110000000000000000000000000000000000000000000000000000000000, 3),
+        (0b0011000000000000000000000000000000000000000000000000000000000000, 4),
+        (0b0101010000000000000000000000000000000000000000000000000000000000, 5),
+        (0b1001100000000000000000000000000000000000000000000000000000000000, 6),
+        (0b1001110000000000000000000000000000000000000000000000000000000000, 7),
     ];
 
     for (input, want) in tests.into_iter().copied() {
-        assert_eq!(receiver_pos(input), want, "input: {:064b}", input);
+        assert_eq!(
+            receiver_pos(input, SMALL_CAP),
+            want,
+            "input: {:064b}",
+            input
+        );
     }
 }
 
@@ -695,7 +701,7 @@ fn channel_remove_waker_null_pointer() {
 fn send_value_removes_waker_from_list_on_drop() {
     let (sender, mut receiver) = new_small::<usize>();
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..sender.capacity() {
         sender.try_send(123).unwrap();
     }
 
@@ -709,7 +715,7 @@ fn send_value_removes_waker_from_list_on_drop() {
     drop(future);
     assert!(receiver.channel().next_waker().is_none());
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..receiver.capacity() {
         assert_eq!(receiver.try_recv().unwrap(), 123);
     }
     drop(receiver);
@@ -721,7 +727,7 @@ fn send_value_removes_waker_from_list_on_drop() {
 fn send_value_removes_waker_from_list_on_drop_polled_with_different_wakers() {
     let (sender, mut receiver) = new_small::<usize>();
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..sender.capacity() {
         sender.try_send(123).unwrap();
     }
 
@@ -738,7 +744,7 @@ fn send_value_removes_waker_from_list_on_drop_polled_with_different_wakers() {
     drop(future);
     assert!(receiver.channel().next_waker().is_none());
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..receiver.capacity() {
         assert_eq!(receiver.try_recv().unwrap(), 123);
     }
     drop(receiver);

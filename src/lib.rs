@@ -116,7 +116,7 @@ const fn has_manager(status: usize) -> bool {
 const STATUS_BITS: u64 = 2; // Number of bits used per slot.
 const STATUS_MASK: u64 = (1 << STATUS_BITS) - 1;
 #[cfg(test)]
-const ALL_STATUSES_MASK: u64 = (1 << (SMALL_CAP as u64 * STATUS_BITS)) - 1;
+const ALL_STATUSES_MASK: u64 = (1 << (MAX_CAP as u64 * STATUS_BITS)) - 1;
 // The possible statuses of a slot.
 const EMPTY: u64 = 0b00; // Slot is empty (initial state).
 const TAKEN: u64 = 0b01; // `Sender` acquired write access, currently writing.
@@ -150,7 +150,7 @@ fn has_status(status: u64, slot: usize, expected: u64) -> bool {
 /// Returns the `STATUS_BITS` for `slot` in `status`.
 #[inline(always)]
 fn slot_status(status: u64, slot: usize) -> u64 {
-    debug_assert!(slot <= SMALL_CAP);
+    debug_assert!(slot <= MAX_CAP);
     (status >> (STATUS_BITS * slot as u64)) & STATUS_MASK
 }
 
@@ -158,7 +158,7 @@ fn slot_status(status: u64, slot: usize) -> u64 {
 /// one of the `MARK_*` constants.
 #[inline(always)]
 fn mark_slot(slot: usize, transition: u64) -> u64 {
-    debug_assert!(slot <= SMALL_CAP);
+    debug_assert!(slot <= MAX_CAP);
     transition << (STATUS_BITS * slot as u64)
 }
 
@@ -174,14 +174,14 @@ fn dbg_status(slot_status: u64) -> &'static str {
 }
 
 // Bits to mark the position of the receiver.
-const POS_BITS: u64 = 3; // Must be `2 ^ POS_BITS == SMALL_CAP`.
+const POS_BITS: u64 = 6; // Must be `2 ^ POS_BITS >= MAX_CAP`.
 const POS_MASK: u64 = (1 << POS_BITS) - 1;
-const MARK_NEXT_POS: u64 = 1 << (STATUS_BITS * SMALL_CAP as u64); // Add to increase position by 1.
+const MARK_NEXT_POS: u64 = 1 << (STATUS_BITS * MAX_CAP as u64); // Add to increase position by 1.
 
-/// Returns the position of the receiver. Will be in 0..SMALL_CAP range.
+/// Returns the position of the receiver. Will be in 0..MAX_CAP range.
 #[inline(always)]
-fn receiver_pos(status: u64) -> usize {
-    (status >> (STATUS_BITS * SMALL_CAP as u64) & POS_MASK) as usize
+fn receiver_pos(status: u64, capacity: usize) -> usize {
+    (status >> (STATUS_BITS * MAX_CAP as u64) & POS_MASK) as usize % capacity
 }
 
 /// Sending side of the channel.
@@ -237,7 +237,7 @@ impl<T> Sender<T> {
 
     /// Returns the capacity of the channel.
     pub fn capacity(&self) -> usize {
-        SMALL_CAP
+        self.channel().slots.len()
     }
 
     /// Returns `true` if the [`Receiver`] and or the [`Manager`] are connected.
@@ -295,8 +295,9 @@ fn try_send<T>(channel: &Channel<T>, value: T) -> Result<(), SendError<T>> {
     // permission to write to the slot later before writing to it. Something
     // we have to do no matter the ordering.
     let mut status: u64 = channel.status.load(Ordering::Relaxed);
-    let start = receiver_pos(status);
-    for slot in (0..SMALL_CAP).cycle().skip(start).take(SMALL_CAP) {
+    let cap = channel.slots.len();
+    let start = receiver_pos(status, cap);
+    for slot in (0..cap).cycle().skip(start).take(cap) {
         if !is_available(status, slot) {
             continue;
         }
@@ -336,7 +337,7 @@ fn try_send<T>(channel: &Channel<T>, value: T) -> Result<(), SendError<T>> {
         debug_assert!(has_status(old_status, slot, TAKEN));
 
         // If the receiver is waiting for this lot we wake it.
-        if receiver_pos(old_status) == slot {
+        if receiver_pos(old_status, cap) == slot {
             channel.wake_receiver();
         }
 
@@ -609,7 +610,7 @@ impl<T> Receiver<T> {
 
     /// Returns the capacity of the channel.
     pub fn capacity(&self) -> usize {
-        SMALL_CAP
+        self.channel().slots.len()
     }
 
     /// Returns `false` if all [`Sender`]s are disconnected.
@@ -673,8 +674,9 @@ fn try_recv<T>(channel: &Channel<T>) -> Result<T, RecvError> {
     // "reset" itself to 0. The status bits will not be touched (even on
     // wrap-around).
     let mut status = channel.status.fetch_add(MARK_NEXT_POS, Ordering::AcqRel);
-    let start = receiver_pos(status);
-    for slot in (0..SMALL_CAP).cycle().skip(start).take(SMALL_CAP) {
+    let cap = channel.slots.len();
+    let start = receiver_pos(status, cap);
+    for slot in (0..cap).cycle().skip(start).take(cap) {
         if !is_filled(status, slot) {
             continue;
         }
@@ -845,9 +847,9 @@ struct Inner {
     /// This contains the status of the slots. Each status consists of
     /// [`STATUS_BITS`] bits to describe if the slot is taken or not.
     ///
-    /// The first `STATUS_BITS * SMALL_CAP` bits are the statuses for the
-    /// `slots` field. The remaining bits are used by the `Sender` to indicate
-    /// its current reading position (modulo `SMALL_CAP`).
+    /// The first `STATUS_BITS * MAX_CAP` bits are the statuses for the `slots`
+    /// field. The remaining bits are used by the `Sender` to indicate its
+    /// current reading position (modulo `MAX_CAP`).
     status: AtomicU64,
 }
 
@@ -1086,7 +1088,7 @@ impl<T> Drop for Channel<T> {
         // Safety: we have unique access, per the mutable reference, so relaxed
         // is fine.
         let status: u64 = self.status.load(Ordering::Relaxed);
-        for slot in 0..SMALL_CAP {
+        for slot in 0..self.slots.len() {
             if is_filled(status, slot) {
                 // Safety: we have unique access to the slot and it's properly
                 // aligned.
