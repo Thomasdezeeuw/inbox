@@ -1,7 +1,7 @@
 //! Tests for the internal API.
 
 use std::future::Future;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::ptr;
 use std::sync::atomic::AtomicPtr;
 use std::task::{self, Poll};
@@ -10,15 +10,24 @@ use futures_test::task::new_count_waker;
 use parking_lot::Mutex;
 
 use crate::{
-    has_status, new_small, receiver_pos, slot_status, Channel, SendValue, WakerList,
-    ALL_STATUSES_MASK, EMPTY, FILLED, MARK_EMPTIED, MARK_NEXT_POS, MARK_READING, POS_BITS, READING,
-    SMALL_CAP, TAKEN,
+    has_status, new_small, receiver_pos, slot_status, Channel, Inner, Manager, Receiver, SendValue,
+    Sender, WakerList, ALL_STATUSES_MASK, EMPTY, FILLED, MARK_EMPTIED, MARK_NEXT_POS, MARK_READING,
+    POS_BITS, READING, SMALL_CAP, TAKEN,
 };
+
+fn test_channel() -> Box<Channel<usize>> {
+    unsafe { Box::from_raw(Channel::new(SMALL_CAP).as_ptr()) }
+}
 
 #[test]
 fn size_assertions() {
-    assert_eq!(size_of::<Channel<()>>(), 56);
-    assert_eq!(size_of::<SendValue<()>>(), 56);
+    let channel = unsafe { Box::from_raw(Channel::<()>::new(SMALL_CAP).as_ptr()) };
+    assert_eq!(size_of_val(&*channel), 56);
+    assert_eq!(size_of::<Inner>(), 56);
+    assert_eq!(size_of::<SendValue<()>>(), 64);
+    assert_eq!(size_of::<Sender<usize>>(), 16);
+    assert_eq!(size_of::<Receiver<usize>>(), 16);
+    assert_eq!(size_of::<Manager<usize>>(), 16);
 }
 
 #[test]
@@ -169,13 +178,13 @@ fn test_receiver_pos() {
 
 #[test]
 fn channel_next_waker_none() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
     assert!(channel.next_waker().is_none());
 }
 
 #[test]
 fn channel_next_waker_single_waker() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker, count) = new_count_waker();
 
@@ -193,7 +202,7 @@ fn channel_next_waker_single_waker() {
 
 #[test]
 fn channel_next_waker_two_wakers() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -223,7 +232,7 @@ fn channel_next_waker_two_wakers() {
 
 #[test]
 fn channel_next_waker_three_wakers() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -265,7 +274,7 @@ fn channel_next_waker_three_wakers() {
 
 #[test]
 fn channel_next_waker_with_none_waker_0() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -300,7 +309,7 @@ fn channel_next_waker_with_none_waker_0() {
 
 #[test]
 fn channel_next_waker_with_none_waker_1() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -335,7 +344,7 @@ fn channel_next_waker_with_none_waker_1() {
 
 #[test]
 fn channel_next_waker_with_none_waker_2() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -370,7 +379,7 @@ fn channel_next_waker_with_none_waker_2() {
 
 #[test]
 fn channel_remove_waker_single_waker() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker, count) = new_count_waker();
 
@@ -388,7 +397,7 @@ fn channel_remove_waker_single_waker() {
 
 #[test]
 fn channel_remove_waker_two_wakers_same_order() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -417,7 +426,7 @@ fn channel_remove_waker_two_wakers_same_order() {
 
 #[test]
 fn channel_remove_waker_two_wakers_reverse_order() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -446,7 +455,7 @@ fn channel_remove_waker_two_wakers_reverse_order() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_0() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -483,7 +492,7 @@ fn channel_remove_waker_three_wakers_order_0() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_1() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -520,7 +529,7 @@ fn channel_remove_waker_three_wakers_order_1() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_2() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -557,7 +566,7 @@ fn channel_remove_waker_three_wakers_order_2() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_3() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -594,7 +603,7 @@ fn channel_remove_waker_three_wakers_order_3() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_4() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -631,7 +640,7 @@ fn channel_remove_waker_three_wakers_order_4() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_5() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -668,7 +677,7 @@ fn channel_remove_waker_three_wakers_order_5() {
 
 #[test]
 fn channel_remove_waker_not_in_list() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
     let waker = WakerList {
         waker: Mutex::new(None),
         next: AtomicPtr::new(ptr::null_mut()),
@@ -678,7 +687,7 @@ fn channel_remove_waker_not_in_list() {
 
 #[test]
 fn channel_remove_waker_null_pointer() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
     channel.remove_waker(ptr::null());
 }
 
