@@ -2,7 +2,7 @@
 
 #![feature(once_cell)]
 
-use inbox::{new_small, Manager, Receiver, RecvError, SendError, SendValue, Sender};
+use inbox::{new_small, Manager, Receiver, RecvError, SendError, SendValue, Sender, MAX_CAP};
 
 mod util;
 
@@ -49,10 +49,24 @@ fn send_value_is_sync() {
 }
 
 #[test]
+#[should_panic = "inbox channel capacity must be between 1 and 29"]
+fn capacity_of_zero_should_panic() {
+    let _ = inbox::new::<()>(0);
+}
+
+#[test]
+#[should_panic = "inbox channel capacity must be between 1 and 29"]
+fn capacity_too_large_should_panic() {
+    let _ = inbox::new::<()>(MAX_CAP + 1);
+}
+
+#[test]
 fn capacities_are_correct() {
-    let (sender, receiver) = new_small::<()>();
-    assert_eq!(sender.capacity(), SMALL_CAP);
-    assert_eq!(receiver.capacity(), SMALL_CAP);
+    for capacity in 1..MAX_CAP {
+        let (sender, receiver) = inbox::new::<()>(capacity);
+        assert_eq!(sender.capacity(), capacity);
+        assert_eq!(receiver.capacity(), capacity);
+    }
 }
 
 #[test]
