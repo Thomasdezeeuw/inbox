@@ -1080,6 +1080,7 @@ impl<T> Deref for Channel<T> {
 impl<T> fmt::Debug for Channel<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = self.status.load(Ordering::Relaxed);
+        let recv_pos = receiver_pos(status, self.slots.len());
         let ref_count = self.ref_count.load(Ordering::Relaxed);
         let sender_count = ref_count & (!(RECEIVER_ALIVE | MANAGER_ALIVE));
         let mut slots = [""; MAX_CAP];
@@ -1091,6 +1092,7 @@ impl<T> fmt::Debug for Channel<T> {
             .field("senders_alive", &sender_count)
             .field("receiver_alive", &(ref_count & RECEIVER_ALIVE != 0))
             .field("manager_alive", &(ref_count & MANAGER_ALIVE != 0))
+            .field("receiver_position", &recv_pos)
             .field("slots", &slots)
             .finish()
     }
