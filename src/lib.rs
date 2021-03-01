@@ -51,9 +51,7 @@
 //! receiver_handle.join().unwrap();
 //! ```
 
-// TODO: support larger channel, with more slots.
-
-#![feature(maybe_uninit_extra, maybe_uninit_ref)]
+#![feature(maybe_uninit_extra)]
 #![warn(
     missing_debug_implementations,
     missing_docs,
@@ -65,15 +63,17 @@
 // Disallow warnings in examples, we want to set a good example after all.
 #![doc(test(attr(deny(warnings))))]
 
+use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::cell::UnsafeCell;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::mem::{size_of, MaybeUninit};
+use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::task::{self, Poll};
 
 use parking_lot::Mutex;
@@ -86,9 +86,30 @@ pub mod oneshot;
 mod waker;
 use waker::WakerRegistration;
 
+/// The capacity of a small channel.
+const SMALL_CAP: usize = 8;
+/// Maximum capacity of a channel.
+// NOTE: see [`Channel::new`] why.
+pub const MAX_CAP: usize = 29;
+/// Minimum capacity of a channel.
+pub const MIN_CAP: usize = 1;
+
 /// Create a small bounded channel.
 pub fn new_small<T>() -> (Sender<T>, Receiver<T>) {
-    let channel = NonNull::from(Box::leak(Box::new(Channel::new())));
+    new(SMALL_CAP)
+}
+
+/// Create a new bounded channel.
+///
+/// The `capacity` must be in the range [`MIN_CAP`]`..=`[`MAX_CAP`].
+pub fn new<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    assert!(
+        (MIN_CAP..=MAX_CAP).contains(&capacity),
+        "inbox channel capacity must be between {} and {}",
+        MIN_CAP,
+        MAX_CAP
+    );
+    let channel = Channel::new(capacity);
     let sender = Sender { channel };
     let receiver = Receiver { channel };
     (sender, receiver)
@@ -105,61 +126,58 @@ const fn has_manager(status: usize) -> bool {
     status & MANAGER_ALIVE != 0
 }
 
-/// The capacity of a small channel.
-const SMALL_CAP: usize = 8;
-
 // Bits to mark the status of a slot.
-const STATUS_BITS: usize = 2; // Number of bits used per slot.
-const STATUS_MASK: usize = (1 << STATUS_BITS) - 1;
+const STATUS_BITS: u64 = 2; // Number of bits used per slot.
+const STATUS_MASK: u64 = (1 << STATUS_BITS) - 1;
 #[cfg(test)]
-const ALL_STATUSES_MASK: usize = (1 << (SMALL_CAP * STATUS_BITS)) - 1;
+const ALL_STATUSES_MASK: u64 = (1 << (MAX_CAP as u64 * STATUS_BITS)) - 1;
 // The possible statuses of a slot.
-const EMPTY: usize = 0b00; // Slot is empty (initial state).
-const TAKEN: usize = 0b01; // `Sender` acquired write access, currently writing.
-const FILLED: usize = 0b11; // `Sender` wrote a value into the slot.
-const READING: usize = 0b10; // A `Receiver` is reading from the slot.
+const EMPTY: u64 = 0b00; // Slot is empty (initial state).
+const TAKEN: u64 = 0b01; // `Sender` acquired write access, currently writing.
+const FILLED: u64 = 0b11; // `Sender` wrote a value into the slot.
+const READING: u64 = 0b10; // A `Receiver` is reading from the slot.
 
 // Status transitions.
-const MARK_TAKEN: usize = 0b01; // OR to go from EMPTY -> TAKEN.
-const MARK_FILLED: usize = 0b11; // OR to go from TAKEN -> FILLED.
-const MARK_READING: usize = 0b01; // XOR to go from FILLED -> READING.
-const MARK_EMPTIED: usize = 0b11; // ! AND to go from FILLED or READING -> EMPTY.
+const MARK_TAKEN: u64 = 0b01; // OR to go from EMPTY -> TAKEN.
+const MARK_FILLED: u64 = 0b11; // OR to go from TAKEN -> FILLED.
+const MARK_READING: u64 = 0b01; // XOR to go from FILLED -> READING.
+const MARK_EMPTIED: u64 = 0b11; // ! AND to go from FILLED or READING -> EMPTY.
 
 /// Returns `true` if `slot` in `status` is empty.
 #[inline(always)]
-fn is_available(status: usize, slot: usize) -> bool {
+fn is_available(status: u64, slot: usize) -> bool {
     has_status(status, slot, EMPTY)
 }
 
 /// Returns `true` if `slot` in `status` is filled.
 #[inline(always)]
-fn is_filled(status: usize, slot: usize) -> bool {
+fn is_filled(status: u64, slot: usize) -> bool {
     has_status(status, slot, FILLED)
 }
 
 /// Returns `true` if `slot` (in `status`) equals the `expected` status.
 #[inline(always)]
-fn has_status(status: usize, slot: usize, expected: usize) -> bool {
+fn has_status(status: u64, slot: usize, expected: u64) -> bool {
     slot_status(status, slot) == expected
 }
 
 /// Returns the `STATUS_BITS` for `slot` in `status`.
 #[inline(always)]
-fn slot_status(status: usize, slot: usize) -> usize {
-    debug_assert!(slot <= SMALL_CAP);
-    (status >> (STATUS_BITS * slot)) & STATUS_MASK
+fn slot_status(status: u64, slot: usize) -> u64 {
+    debug_assert!(slot <= MAX_CAP);
+    (status >> (STATUS_BITS * slot as u64)) & STATUS_MASK
 }
 
 /// Creates a mask to transition `slot` using `transition`. `transition` must be
 /// one of the `MARK_*` constants.
 #[inline(always)]
-fn mark_slot(slot: usize, transition: usize) -> usize {
-    debug_assert!(slot <= SMALL_CAP);
-    transition << (STATUS_BITS * slot)
+fn mark_slot(slot: usize, transition: u64) -> u64 {
+    debug_assert!(slot <= MAX_CAP);
+    transition << (STATUS_BITS * slot as u64)
 }
 
 /// Returns a string name for the `slot_status`.
-fn dbg_status(slot_status: usize) -> &'static str {
+fn dbg_status(slot_status: u64) -> &'static str {
     match slot_status {
         EMPTY => "EMPTY",
         TAKEN => "TAKEN",
@@ -170,14 +188,12 @@ fn dbg_status(slot_status: usize) -> &'static str {
 }
 
 // Bits to mark the position of the receiver.
-const POS_BITS: usize = 3; // Must be `2 ^ POS_BITS == SMALL_CAP`.
-const POS_MASK: usize = (1 << POS_BITS) - 1;
-const MARK_NEXT_POS: usize = 1 << (STATUS_BITS * SMALL_CAP); // Add to increase position by 1.
+const MARK_NEXT_POS: u64 = 1 << (STATUS_BITS * MAX_CAP as u64); // Add to increase position by 1.
 
-/// Returns the position of the receiver. Will be in 0..SMALL_CAP range.
+/// Returns the position of the receiver. Will be in 0..[`MAX_CAP`] range.
 #[inline(always)]
-fn receiver_pos(status: usize) -> usize {
-    status >> (STATUS_BITS * SMALL_CAP) & POS_MASK
+fn receiver_pos(status: u64, capacity: usize) -> usize {
+    (status >> (STATUS_BITS * MAX_CAP as u64)) as usize % capacity
 }
 
 /// Sending side of the channel.
@@ -233,7 +249,7 @@ impl<T> Sender<T> {
 
     /// Returns the capacity of the channel.
     pub fn capacity(&self) -> usize {
-        SMALL_CAP
+        self.channel().slots.len()
     }
 
     /// Returns `true` if the [`Receiver`] and or the [`Manager`] are connected.
@@ -273,7 +289,7 @@ impl<T> Sender<T> {
 
     /// Returns the id of this sender.
     pub fn id(&self) -> Id {
-        Id(self.channel.as_ptr() as usize)
+        Id(self.channel.as_ptr() as *const () as usize)
     }
 
     fn channel(&self) -> &Channel<T> {
@@ -290,9 +306,10 @@ fn try_send<T>(channel: &Channel<T>, value: T) -> Result<(), SendError<T>> {
     // NOTE: relaxed ordering here is ok because we acquire unique
     // permission to write to the slot later before writing to it. Something
     // we have to do no matter the ordering.
-    let mut status: usize = channel.status.load(Ordering::Relaxed);
-    let start = receiver_pos(status);
-    for slot in (0..SMALL_CAP).cycle().skip(start).take(SMALL_CAP) {
+    let mut status: u64 = channel.status.load(Ordering::Relaxed);
+    let cap = channel.slots.len();
+    let start = receiver_pos(status, cap);
+    for slot in (0..cap).cycle().skip(start).take(cap) {
         if !is_available(status, slot) {
             continue;
         }
@@ -332,7 +349,7 @@ fn try_send<T>(channel: &Channel<T>, value: T) -> Result<(), SendError<T>> {
         debug_assert!(has_status(old_status, slot, TAKEN));
 
         // If the receiver is waiting for this lot we wake it.
-        if receiver_pos(old_status) == slot {
+        if receiver_pos(old_status, cap) == slot {
             channel.wake_receiver();
         }
 
@@ -366,7 +383,7 @@ impl<T> Clone for Sender<T> {
 impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sender")
-            .field("channel", self.channel())
+            .field("channel", &self.channel())
             .finish()
     }
 }
@@ -605,7 +622,7 @@ impl<T> Receiver<T> {
 
     /// Returns the capacity of the channel.
     pub fn capacity(&self) -> usize {
-        SMALL_CAP
+        self.channel().slots.len()
     }
 
     /// Returns `false` if all [`Sender`]s are disconnected.
@@ -638,7 +655,7 @@ impl<T> Receiver<T> {
 
     /// Returns the id of this receiver.
     pub fn id(&self) -> Id {
-        Id(self.channel.as_ptr() as usize)
+        Id(self.channel.as_ptr() as *const () as usize)
     }
 
     fn channel(&self) -> &Channel<T> {
@@ -669,8 +686,9 @@ fn try_recv<T>(channel: &Channel<T>) -> Result<T, RecvError> {
     // "reset" itself to 0. The status bits will not be touched (even on
     // wrap-around).
     let mut status = channel.status.fetch_add(MARK_NEXT_POS, Ordering::AcqRel);
-    let start = receiver_pos(status);
-    for slot in (0..SMALL_CAP).cycle().skip(start).take(SMALL_CAP) {
+    let cap = channel.slots.len();
+    let start = receiver_pos(status, cap);
+    for slot in (0..cap).cycle().skip(start).take(cap) {
         if !is_filled(status, slot) {
             continue;
         }
@@ -725,7 +743,7 @@ fn is_receiver_connected<T>(channel: &Channel<T>) -> bool {
 impl<T: fmt::Debug> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Receiver")
-            .field("channel", self.channel())
+            .field("channel", &self.channel())
             .finish()
     }
 }
@@ -817,17 +835,16 @@ impl<'r, T> Unpin for RecvValue<'r, T> {}
 /// Channel internals shared between zero or more [`Sender`]s, zero or one
 /// [`Receiver`] and zero or one [`Manager`].
 struct Channel<T> {
-    /// Status of the slots.
-    ///
-    /// This contains the status of the slots. Each status consists of
-    /// [`STATUS_BITS`] bits to describe if the slot is taken or not.
-    ///
-    /// The first `STATUS_BITS * SMALL_CAP` bits are the statuses for the
-    /// `slots` field. The remaining bits are used by the `Sender` to indicate
-    /// its current reading position (modulo `SMALL_CAP`).
-    status: AtomicUsize,
+    inner: Inner,
     /// The slots in the channel, see `status` for what slots are used/unused.
-    slots: [UnsafeCell<MaybeUninit<T>>; SMALL_CAP],
+    slots: [UnsafeCell<MaybeUninit<T>>],
+}
+
+/// Inner data of [`Channel`].
+///
+/// This is only in a different struct to calculate the `Layout` of `Channel`,
+/// see [`Channel::new`].
+struct Inner {
     /// The number of senders alive. If the [`RECEIVER_ALIVE`] bit is set the
     /// [`Receiver`] is alive. If the [`MANAGER_ALIVE`] bit is the [`Manager`]
     /// is alive.
@@ -837,6 +854,15 @@ struct Channel<T> {
     /// If this is not null it must point to valid memory.
     sender_waker_head: AtomicPtr<WakerList>,
     receiver_waker: WakerRegistration,
+    /// Status of the slots.
+    ///
+    /// This contains the status of the slots. Each status consists of
+    /// [`STATUS_BITS`] bits to describe if the slot is taken or not.
+    ///
+    /// The first `STATUS_BITS * MAX_CAP` bits are the statuses for the `slots`
+    /// field. The remaining bits are used by the `Sender` to indicate its
+    /// current reading position (modulo [`MAX_CAP`]).
+    status: AtomicU64,
 }
 
 // Safety: if the value can be send across thread than so can the channel.
@@ -853,24 +879,43 @@ struct WakerList {
 }
 
 impl<T> Channel<T> {
-    /// Marks a single [`Receiver`] and [`Sender`] as alive.
-    const fn new() -> Channel<T> {
-        Channel {
-            slots: [
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-                UnsafeCell::new(MaybeUninit::uninit()),
-            ],
-            status: AtomicUsize::new(0),
-            ref_count: AtomicUsize::new(RECEIVER_ALIVE | 1),
-            sender_waker_head: AtomicPtr::new(ptr::null_mut()),
-            receiver_waker: WakerRegistration::new(),
+    /// Allocates a new `Channel` on the heap.
+    ///
+    /// `capacity` must small enough to ensure each slot has 2 bits for the
+    /// status, while ensuring that the remaining bits can store `capacity` (in
+    /// binary) to keep track of the reading position. This means following must
+    /// hold true where $N is capacity: `2 ^ (64 - ($N * 2)) >= $N`. The maximum
+    /// is 29.
+    fn new(capacity: usize) -> NonNull<Channel<T>> {
+        assert!(capacity != 0, "capacity can't be zero");
+        assert!(capacity <= MAX_CAP, "capacity too large");
+
+        // Allocate some raw bytes.
+        // Safety: returns an error on arithmetic overflow, but it should be OK
+        // with a capacity <= MAX_CAP.
+        let (layout, _) = Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity)
+            .and_then(|slots_layout| Layout::new::<Inner>().extend(slots_layout))
+            .unwrap();
+        // Safety: we check if the allocation is successful.
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            handle_alloc_error(layout);
         }
+        let ptr = ptr::slice_from_raw_parts_mut(ptr as *mut T, capacity) as *mut Channel<T>;
+
+        // Initialise all fields (that need it).
+        unsafe {
+            ptr::addr_of_mut!((*ptr).inner.ref_count).write(AtomicUsize::new(RECEIVER_ALIVE | 1));
+            ptr::addr_of_mut!((*ptr).inner.sender_waker_head)
+                .write(AtomicPtr::new(ptr::null_mut()));
+            ptr::addr_of_mut!((*ptr).inner.receiver_waker).write(WakerRegistration::new());
+            ptr::addr_of_mut!((*ptr).inner.status).write(AtomicU64::new(0));
+            // TODO: does `slots` need to be initialised with
+            // `UnsafeCell::new(MaybeUninit::uninit())`?
+        }
+
+        // Safety: checked if the pointer is null above.
+        unsafe { NonNull::new_unchecked(ptr) }
     }
 
     /// Returns the next `task::Waker` to wake, if any.
@@ -1022,28 +1067,33 @@ impl<T> Channel<T> {
     }
 }
 
+// NOTE: this is here so we don't have to type `self.channel().inner`
+// everywhere.
+impl<T> Deref for Channel<T> {
+    type Target = Inner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl<T> fmt::Debug for Channel<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = self.status.load(Ordering::Relaxed);
+        let recv_pos = receiver_pos(status, self.slots.len());
         let ref_count = self.ref_count.load(Ordering::Relaxed);
         let sender_count = ref_count & (!(RECEIVER_ALIVE | MANAGER_ALIVE));
+        let mut slots = [""; MAX_CAP];
+        for n in 0..self.slots.len() {
+            slots[n] = dbg_status(slot_status(status, n));
+        }
+        let slots = &slots[..self.slots.len()];
         f.debug_struct("Channel")
             .field("senders_alive", &sender_count)
             .field("receiver_alive", &(ref_count & RECEIVER_ALIVE != 0))
             .field("manager_alive", &(ref_count & MANAGER_ALIVE != 0))
-            .field(
-                "slots",
-                &[
-                    dbg_status(slot_status(status, 0)),
-                    dbg_status(slot_status(status, 1)),
-                    dbg_status(slot_status(status, 2)),
-                    dbg_status(slot_status(status, 3)),
-                    dbg_status(slot_status(status, 4)),
-                    dbg_status(slot_status(status, 5)),
-                    dbg_status(slot_status(status, 6)),
-                    dbg_status(slot_status(status, 7)),
-                ],
-            )
+            .field("receiver_position", &recv_pos)
+            .field("slots", &slots)
             .finish()
     }
 }
@@ -1052,8 +1102,8 @@ impl<T> Drop for Channel<T> {
     fn drop(&mut self) {
         // Safety: we have unique access, per the mutable reference, so relaxed
         // is fine.
-        let status: usize = self.status.load(Ordering::Relaxed);
-        for slot in 0..SMALL_CAP {
+        let status: u64 = self.status.load(Ordering::Relaxed);
+        for slot in 0..self.slots.len() {
             if is_filled(status, slot) {
                 // Safety: we have unique access to the slot and it's properly
                 // aligned.
@@ -1093,7 +1143,14 @@ impl<T> Manager<T> {
     ///
     /// Same as [`new_small`] but with a `Manager`.
     pub fn new_small_channel() -> (Manager<T>, Sender<T>, Receiver<T>) {
-        let (sender, receiver) = new_small();
+        Manager::new_channel(SMALL_CAP)
+    }
+
+    /// Create a bounded channel with a `Manager`.
+    ///
+    /// Same as [`new`] but with a `Manager`.
+    pub fn new_channel(capacity: usize) -> (Manager<T>, Sender<T>, Receiver<T>) {
+        let (sender, receiver) = new(capacity);
         let old_count = sender
             .channel()
             .ref_count
@@ -1147,7 +1204,7 @@ impl<T> Manager<T> {
 impl<T> fmt::Debug for Manager<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Manager")
-            .field("channel", self.channel())
+            .field("channel", &self.channel())
             .finish()
     }
 }

@@ -1,7 +1,7 @@
 //! Tests for the internal API.
 
 use std::future::Future;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::ptr;
 use std::sync::atomic::AtomicPtr;
 use std::task::{self, Poll};
@@ -10,24 +10,30 @@ use futures_test::task::new_count_waker;
 use parking_lot::Mutex;
 
 use crate::{
-    has_status, new_small, receiver_pos, slot_status, Channel, SendValue, WakerList,
-    ALL_STATUSES_MASK, EMPTY, FILLED, MARK_EMPTIED, MARK_NEXT_POS, MARK_READING, POS_BITS, READING,
-    SMALL_CAP, TAKEN,
+    has_status, new_small, receiver_pos, slot_status, Channel, Inner, Manager, Receiver, SendValue,
+    Sender, WakerList, ALL_STATUSES_MASK, EMPTY, FILLED, MARK_EMPTIED, MARK_NEXT_POS, MARK_READING,
+    READING, SMALL_CAP, TAKEN,
 };
+
+fn test_channel() -> Box<Channel<usize>> {
+    unsafe { Box::from_raw(Channel::new(SMALL_CAP).as_ptr()) }
+}
 
 #[test]
 fn size_assertions() {
-    assert_eq!(size_of::<Channel<()>>(), 56);
-    assert_eq!(size_of::<SendValue<()>>(), 56);
+    let channel = unsafe { Box::from_raw(Channel::<()>::new(SMALL_CAP).as_ptr()) };
+    assert_eq!(size_of_val(&*channel), 56);
+    assert_eq!(size_of::<Inner>(), 56);
+    assert_eq!(size_of::<SendValue<()>>(), 64);
+    assert_eq!(size_of::<Sender<usize>>(), 16);
+    assert_eq!(size_of::<Receiver<usize>>(), 16);
+    assert_eq!(size_of::<Manager<usize>>(), 16);
 }
 
 #[test]
 fn assertions() {
     // Various assertions that must be true for the channel to work
     // correctly.
-
-    // Enough bits for the statuses of the slots.
-    assert_eq!(2_usize.pow(POS_BITS as u32), SMALL_CAP);
 
     // Status are different.
     assert_ne!(EMPTY, TAKEN);
@@ -49,12 +55,12 @@ fn assertions() {
     assert_eq!(READING & !MARK_EMPTIED, EMPTY);
 
     // Changing `Receiver` position doesn't change status of slots.
-    const ORIGINAL_STATUS: usize = 0b1110010011100100;
+    const ORIGINAL_STATUS: u64 = 0b1110010011100100;
     assert_eq!(
         (size_of::<usize>() * 8) - (ORIGINAL_STATUS.leading_zeros() as usize),
         2 * SMALL_CAP
     );
-    let mut status: usize = ORIGINAL_STATUS.wrapping_sub(MARK_NEXT_POS);
+    let mut status: u64 = ORIGINAL_STATUS.wrapping_sub(MARK_NEXT_POS);
     status = status.wrapping_add(MARK_NEXT_POS);
     assert_eq!(status, ORIGINAL_STATUS);
     status = status.wrapping_add(MARK_NEXT_POS);
@@ -142,40 +148,46 @@ fn test_has_status() {
 
 #[test]
 fn test_receiver_pos() {
+    #[rustfmt::skip]
     let tests = &[
-        (0b000_1110010011100100, 0),
-        (0b001_1110010011100100, 1),
-        (0b010_1110010011100100, 2),
-        (0b011_1110010011100100, 3),
-        (0b100_1110010011100100, 4),
-        (0b101_1110010011100100, 5),
-        (0b110_1110010011100100, 6),
-        (0b111_1110010011100100, 7),
+        (0b0000000000000000000000000000000000000000000000000000000000000000, 0),
+        (0b0000010000000000000000000000000000000000000000000000000000000000, 1),
+        (0b0000100000000000000000000000000000000000000000000000000000000000, 2),
+        (0b0000110000000000000000000000000000000000000000000000000000000000, 3),
+        (0b0001000000000000000000000000000000000000000000000000000000000000, 4),
+        (0b0001010000000000000000000000000000000000000000000000000000000000, 5),
+        (0b0001100000000000000000000000000000000000000000000000000000000000, 6),
+        (0b0001110000000000000000000000000000000000000000000000000000000000, 7),
         // Additional bits are ignored.
-        (0b1_000_1110010011100100, 0),
-        (0b1_001_1110010011100100, 1),
-        (0b1_010_1110010011100100, 2),
-        (0b1_011_1110010011100100, 3),
-        (0b1_100_1110010011100100, 4),
-        (0b1_101_1110010011100100, 5),
-        (0b1_110_1110010011100100, 6),
-        (0b1_111_1110010011100100, 7),
+        (0b0000000000000000000000000000000000000000000000000000000000000000, 0),
+        (0b1000010000000000000000000000000000000000000000000000000000000000, 1),
+        (0b1000100000000000000000000000000000000000000000000000000000000000, 2),
+        (0b0100110000000000000000000000000000000000000000000000000000000000, 3),
+        (0b0011000000000000000000000000000000000000000000000000000000000000, 4),
+        (0b0101010000000000000000000000000000000000000000000000000000000000, 5),
+        (0b1001100000000000000000000000000000000000000000000000000000000000, 6),
+        (0b1001110000000000000000000000000000000000000000000000000000000000, 7),
     ];
 
     for (input, want) in tests.into_iter().copied() {
-        assert_eq!(receiver_pos(input), want, "input: {:064b}", input);
+        assert_eq!(
+            receiver_pos(input, SMALL_CAP),
+            want,
+            "input: {:064b}",
+            input
+        );
     }
 }
 
 #[test]
 fn channel_next_waker_none() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
     assert!(channel.next_waker().is_none());
 }
 
 #[test]
 fn channel_next_waker_single_waker() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker, count) = new_count_waker();
 
@@ -193,7 +205,7 @@ fn channel_next_waker_single_waker() {
 
 #[test]
 fn channel_next_waker_two_wakers() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -223,7 +235,7 @@ fn channel_next_waker_two_wakers() {
 
 #[test]
 fn channel_next_waker_three_wakers() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -265,7 +277,7 @@ fn channel_next_waker_three_wakers() {
 
 #[test]
 fn channel_next_waker_with_none_waker_0() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -300,7 +312,7 @@ fn channel_next_waker_with_none_waker_0() {
 
 #[test]
 fn channel_next_waker_with_none_waker_1() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -335,7 +347,7 @@ fn channel_next_waker_with_none_waker_1() {
 
 #[test]
 fn channel_next_waker_with_none_waker_2() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -370,7 +382,7 @@ fn channel_next_waker_with_none_waker_2() {
 
 #[test]
 fn channel_remove_waker_single_waker() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker, count) = new_count_waker();
 
@@ -388,7 +400,7 @@ fn channel_remove_waker_single_waker() {
 
 #[test]
 fn channel_remove_waker_two_wakers_same_order() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -417,7 +429,7 @@ fn channel_remove_waker_two_wakers_same_order() {
 
 #[test]
 fn channel_remove_waker_two_wakers_reverse_order() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -446,7 +458,7 @@ fn channel_remove_waker_two_wakers_reverse_order() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_0() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -483,7 +495,7 @@ fn channel_remove_waker_three_wakers_order_0() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_1() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -520,7 +532,7 @@ fn channel_remove_waker_three_wakers_order_1() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_2() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -557,7 +569,7 @@ fn channel_remove_waker_three_wakers_order_2() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_3() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -594,7 +606,7 @@ fn channel_remove_waker_three_wakers_order_3() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_4() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -631,7 +643,7 @@ fn channel_remove_waker_three_wakers_order_4() {
 
 #[test]
 fn channel_remove_waker_three_wakers_order_5() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
 
     let (waker1, count1) = new_count_waker();
     let (waker2, count2) = new_count_waker();
@@ -668,7 +680,7 @@ fn channel_remove_waker_three_wakers_order_5() {
 
 #[test]
 fn channel_remove_waker_not_in_list() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
     let waker = WakerList {
         waker: Mutex::new(None),
         next: AtomicPtr::new(ptr::null_mut()),
@@ -678,7 +690,7 @@ fn channel_remove_waker_not_in_list() {
 
 #[test]
 fn channel_remove_waker_null_pointer() {
-    let channel = Channel::<usize>::new();
+    let channel = test_channel();
     channel.remove_waker(ptr::null());
 }
 
@@ -686,7 +698,7 @@ fn channel_remove_waker_null_pointer() {
 fn send_value_removes_waker_from_list_on_drop() {
     let (sender, mut receiver) = new_small::<usize>();
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..sender.capacity() {
         sender.try_send(123).unwrap();
     }
 
@@ -700,7 +712,7 @@ fn send_value_removes_waker_from_list_on_drop() {
     drop(future);
     assert!(receiver.channel().next_waker().is_none());
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..receiver.capacity() {
         assert_eq!(receiver.try_recv().unwrap(), 123);
     }
     drop(receiver);
@@ -712,7 +724,7 @@ fn send_value_removes_waker_from_list_on_drop() {
 fn send_value_removes_waker_from_list_on_drop_polled_with_different_wakers() {
     let (sender, mut receiver) = new_small::<usize>();
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..sender.capacity() {
         sender.try_send(123).unwrap();
     }
 
@@ -729,7 +741,7 @@ fn send_value_removes_waker_from_list_on_drop_polled_with_different_wakers() {
     drop(future);
     assert!(receiver.channel().next_waker().is_none());
 
-    for _ in 0..SMALL_CAP {
+    for _ in 0..receiver.capacity() {
         assert_eq!(receiver.try_recv().unwrap(), 123);
     }
     drop(receiver);
