@@ -382,6 +382,13 @@ fn receiver_new_sender() {
     });
 }
 
+#[test]
+fn with_metadata() {
+    let (sender, receiver) = inbox::new_with_metadata::<usize, _>(1, "abc");
+    assert_eq!(*sender.metadata(), "abc");
+    assert_eq!(*receiver.metadata(), "abc");
+}
+
 mod future {
     //! Tests for the `Future` implementations.
 
@@ -1098,5 +1105,13 @@ mod manager {
         assert!(sender2a.sends_to(&receiver2));
         assert!(!sender2b.sends_to(&receiver1));
         assert!(sender2b.sends_to(&receiver2));
+    }
+
+    #[test]
+    fn with_metadata() {
+        let (manager, sender, receiver) = Manager::<usize, _>::new_channel_with_metadata(1, "abc");
+        assert_eq!(*sender.metadata(), "abc");
+        assert_eq!(*receiver.metadata(), "abc");
+        assert_eq!(*manager.metadata(), "abc");
     }
 }

@@ -116,13 +116,23 @@ pub fn new_small<T>() -> (Sender<T>, Receiver<T>) {
 ///
 /// The `capacity` must be in the range [`MIN_CAP`]`..=`[`MAX_CAP`].
 pub fn new<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    new_with_metadata(capacity, ())
+}
+
+/// Create a new bounded channel with `metadata`.
+///
+/// The `capacity` must be in the range [`MIN_CAP`]`..=`[`MAX_CAP`].
+///
+/// The metadata can be retrieved using [`Sender::metadata`] and
+/// [`Receiver::metadata`].
+pub fn new_with_metadata<T, M>(capacity: usize, metadata: M) -> (Sender<T, M>, Receiver<T, M>) {
     assert!(
         (MIN_CAP..=MAX_CAP).contains(&capacity),
         "inbox channel capacity must be between {} and {}",
         MIN_CAP,
         MAX_CAP
     );
-    let channel = Channel::new(capacity);
+    let channel = Channel::new(capacity, metadata);
     let sender = Sender { channel };
     let receiver = Receiver { channel };
     (sender, receiver)
@@ -237,8 +247,8 @@ fn receiver_pos(status: u64, capacity: usize) -> usize {
 }
 
 /// Sending side of the channel.
-pub struct Sender<T> {
-    channel: NonNull<Channel<T>>,
+pub struct Sender<T, M = ()> {
+    channel: NonNull<Channel<T, M>>,
 }
 
 /// Error returned in case sending a value across the channel fails. See
@@ -262,7 +272,7 @@ impl<T> fmt::Display for SendError<T> {
 
 impl<T: fmt::Debug> Error for SendError<T> {}
 
-impl<T> Sender<T> {
+impl<T, M> Sender<T, M> {
     /// Attempts to send the `value` into the channel.
     pub fn try_send(&self, value: T) -> Result<(), SendError<T>> {
         try_send(self.channel(), value)
@@ -278,7 +288,7 @@ impl<T> Sender<T> {
     /// [`Poll::Pending`] instead.
     ///
     /// [disconnected]: Sender::is_connected
-    pub fn send<'s>(&'s self, value: T) -> SendValue<'s, T> {
+    pub fn send<'s>(&'s self, value: T) -> SendValue<'s, T, M> {
         SendValue {
             channel: self.channel(),
             value: Some(value),
@@ -290,7 +300,7 @@ impl<T> Sender<T> {
     /// [disconnected].
     ///
     /// [disconnected]: Sender::is_connected
-    pub fn join<'s>(&'s self) -> Join<'s, T> {
+    pub fn join<'s>(&'s self) -> Join<'s, T, M> {
         Join {
             channel: self.channel(),
             registered_waker: None,
@@ -323,12 +333,12 @@ impl<T> Sender<T> {
     }
 
     /// Returns `true` if senders send into the same channel.
-    pub fn same_channel(&self, other: &Sender<T>) -> bool {
+    pub fn same_channel(&self, other: &Sender<T, M>) -> bool {
         self.channel == other.channel
     }
 
     /// Returns `true` if this sender sends to the `receiver`.
-    pub fn sends_to(&self, receiver: &Receiver<T>) -> bool {
+    pub fn sends_to(&self, receiver: &Receiver<T, M>) -> bool {
         self.channel == receiver.channel
     }
 
@@ -337,13 +347,18 @@ impl<T> Sender<T> {
         Id(self.channel.as_ptr() as *const () as usize)
     }
 
-    fn channel(&self) -> &Channel<T> {
+    /// Returns a reference to the metadata of the channel.
+    pub fn metadata(&self) -> &M {
+        &self.channel().metadata
+    }
+
+    fn channel(&self) -> &Channel<T, M> {
         unsafe { self.channel.as_ref() }
     }
 }
 
 /// See [`Sender::try_send`].
-fn try_send<T>(channel: &Channel<T>, value: T) -> Result<(), SendError<T>> {
+fn try_send<T, M>(channel: &Channel<T, M>, value: T) -> Result<(), SendError<T>> {
     if !has_receiver_or_manager(channel.ref_count.load(Ordering::Relaxed)) {
         return Err(SendError::Disconnected(value));
     }
@@ -408,8 +423,8 @@ fn try_send<T>(channel: &Channel<T>, value: T) -> Result<(), SendError<T>> {
 ///
 /// Only `2 ^ 30` (a billion) `Sender`s may be alive concurrently, more then
 /// enough for all practical use cases.
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Sender<T> {
+impl<T, M> Clone for Sender<T, M> {
+    fn clone(&self) -> Sender<T, M> {
         // For the reasoning behind this relaxed ordering see `Arc::clone`.
         let old_ref_count = self.channel().ref_count.fetch_add(1, Ordering::Relaxed);
         debug_assert!(old_ref_count & SENDER_ACCESS != 0);
@@ -419,7 +434,7 @@ impl<T> Clone for Sender<T> {
     }
 }
 
-impl<T> fmt::Debug for Sender<T> {
+impl<T, M> fmt::Debug for Sender<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sender")
             .field("channel", &self.channel())
@@ -428,13 +443,13 @@ impl<T> fmt::Debug for Sender<T> {
 }
 
 // Safety: if the value can be send across thread than so can the channel.
-unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send, M: Send> Send for Sender<T, M> {}
 
-unsafe impl<T> Sync for Sender<T> {}
+unsafe impl<T, M> Sync for Sender<T, M> {}
 
-impl<T> Unpin for Sender<T> {}
+impl<T, M> Unpin for Sender<T, M> {}
 
-impl<T> Drop for Sender<T> {
+impl<T, M> Drop for Sender<T, M> {
     #[rustfmt::skip]
     fn drop(&mut self) {
         // Safety: for the reasoning behind this ordering see `Arc::drop`.
@@ -470,13 +485,13 @@ impl<T> Drop for Sender<T> {
 /// [`Future`] implementation behind [`Sender::send`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct SendValue<'s, T> {
-    channel: &'s Channel<T>,
+pub struct SendValue<'s, T, M = ()> {
+    channel: &'s Channel<T, M>,
     value: Option<T>,
     registered_waker: Option<task::Waker>,
 }
 
-impl<'s, T> Future for SendValue<'s, T> {
+impl<'s, T, M> Future for SendValue<'s, T, M> {
     type Output = Result<(), T>;
 
     fn poll(mut self: Pin<&mut Self>, ctx: &mut task::Context) -> Poll<Self::Output> {
@@ -521,9 +536,9 @@ impl<'s, T> Future for SendValue<'s, T> {
     }
 }
 
-unsafe impl<'s, T> Sync for SendValue<'s, T> {}
+unsafe impl<'s, T, M> Sync for SendValue<'s, T, M> {}
 
-impl<'s, T> Drop for SendValue<'s, T> {
+impl<'s, T, M> Drop for SendValue<'s, T, M> {
     fn drop(&mut self) {
         if let Some(waker) = self.registered_waker.take() {
             let mut sender_wakers = self.channel.sender_wakers.lock();
@@ -538,12 +553,12 @@ impl<'s, T> Drop for SendValue<'s, T> {
 /// [`Future`] implementation behind [`Sender::join`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Join<'s, T> {
-    channel: &'s Channel<T>,
+pub struct Join<'s, T, M = ()> {
+    channel: &'s Channel<T, M>,
     registered_waker: Option<task::Waker>,
 }
 
-impl<'s, T> Future for Join<'s, T> {
+impl<'s, T, M> Future for Join<'s, T, M> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, ctx: &mut task::Context) -> Poll<Self::Output> {
@@ -569,9 +584,9 @@ impl<'s, T> Future for Join<'s, T> {
     }
 }
 
-unsafe impl<'s, T> Sync for Join<'s, T> {}
+unsafe impl<'s, T, M> Sync for Join<'s, T, M> {}
 
-impl<'s, T> Drop for Join<'s, T> {
+impl<'s, T, M> Drop for Join<'s, T, M> {
     fn drop(&mut self) {
         if let Some(waker) = self.registered_waker.take() {
             let mut join_wakers = self.channel.join_wakers.lock();
@@ -625,8 +640,8 @@ fn register_waker(
 }
 
 /// Receiving side of the channel.
-pub struct Receiver<T> {
-    channel: NonNull<Channel<T>>,
+pub struct Receiver<T, M = ()> {
+    channel: NonNull<Channel<T, M>>,
 }
 
 /// Error returned in case receiving a value from the channel fails. See
@@ -651,7 +666,7 @@ impl fmt::Display for RecvError {
 
 impl Error for RecvError {}
 
-impl<T> Receiver<T> {
+impl<T, M> Receiver<T, M> {
     /// Attempts to receive a value from this channel.
     pub fn try_recv(&mut self) -> Result<T, RecvError> {
         try_recv(self.channel())
@@ -666,7 +681,7 @@ impl<T> Receiver<T> {
     /// [`Poll::Pending`] instead.
     ///
     /// [disconnected]: Receiver::is_connected
-    pub fn recv<'r>(&'r mut self) -> RecvValue<'r, T> {
+    pub fn recv<'r>(&'r mut self) -> RecvValue<'r, T, M> {
         RecvValue {
             channel: self.channel(),
         }
@@ -680,7 +695,7 @@ impl<T> Receiver<T> {
     /// [`Sender::clone`].
     ///
     /// [`Sender::clone`]: struct.Sender.html#impl-Clone
-    pub fn new_sender(&self) -> Sender<T> {
+    pub fn new_sender(&self) -> Sender<T, M> {
         // For the reasoning behind this relaxed ordering see `Arc::clone`.
         let old_ref_count = self.channel().ref_count.fetch_add(1, Ordering::Relaxed);
         if old_ref_count & SENDER_ACCESS != 0 {
@@ -735,13 +750,18 @@ impl<T> Receiver<T> {
         Id(self.channel.as_ptr() as *const () as usize)
     }
 
-    fn channel(&self) -> &Channel<T> {
+    /// Returns a reference to the metadata of the channel.
+    pub fn metadata(&self) -> &M {
+        &self.channel().metadata
+    }
+
+    fn channel(&self) -> &Channel<T, M> {
         unsafe { self.channel.as_ref() }
     }
 }
 
 /// See [`Receiver::try_recv`].
-fn try_recv<T>(channel: &Channel<T>) -> Result<T, RecvError> {
+fn try_recv<T, M>(channel: &Channel<T, M>) -> Result<T, RecvError> {
     // We check if we are connected **before** checking for messages. This
     // is important because there is a time between 1) the checking of the
     // messages in the channel and 2) checking if we're connected (if we
@@ -817,13 +837,13 @@ impl<T: fmt::Debug> fmt::Debug for Receiver<T> {
 }
 
 // Safety: if the value can be send across thread than so can the channel.
-unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl<T: Send, M: Send> Send for Receiver<T, M> {}
 
-unsafe impl<T> Sync for Receiver<T> {}
+unsafe impl<T, M> Sync for Receiver<T, M> {}
 
-impl<T> Unpin for Receiver<T> {}
+impl<T, M> Unpin for Receiver<T, M> {}
 
-impl<T> Drop for Receiver<T> {
+impl<T, M> Drop for Receiver<T, M> {
     #[rustfmt::skip]
     fn drop(&mut self) {
         // First mark the receiver as dropped.
@@ -872,11 +892,11 @@ impl<T> Drop for Receiver<T> {
 /// [`Future`] implementation behind [`Receiver::recv`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct RecvValue<'r, T> {
-    channel: &'r Channel<T>,
+pub struct RecvValue<'r, T, M = ()> {
+    channel: &'r Channel<T, M>,
 }
 
-impl<'r, T> Future for RecvValue<'r, T> {
+impl<'r, T, M> Future for RecvValue<'r, T, M> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut task::Context) -> Poll<Self::Output> {
@@ -904,12 +924,12 @@ impl<'r, T> Future for RecvValue<'r, T> {
     }
 }
 
-impl<'r, T> Unpin for RecvValue<'r, T> {}
+impl<'r, T, M> Unpin for RecvValue<'r, T, M> {}
 
 /// Channel internals shared between zero or more [`Sender`]s, zero or one
 /// [`Receiver`] and zero or one [`Manager`].
-struct Channel<T> {
-    inner: Inner,
+struct Channel<T, M> {
+    inner: Inner<M>,
     /// The slots in the channel, see `status` for what slots are used/unused.
     slots: [UnsafeCell<MaybeUninit<T>>],
 }
@@ -918,7 +938,7 @@ struct Channel<T> {
 ///
 /// This is only in a different struct to calculate the `Layout` of `Channel`,
 /// see [`Channel::new`].
-struct Inner {
+struct Inner<M> {
     /// Status of the slots.
     ///
     /// This contains the status of the slots. Each status consists of
@@ -935,14 +955,16 @@ struct Inner {
     sender_wakers: Mutex<Vec<task::Waker>>,
     join_wakers: Mutex<Vec<task::Waker>>,
     receiver_waker: WakerRegistration,
+    /// User specified metadata.
+    metadata: M,
 }
 
 // Safety: if the value can be send across thread than so can the channel.
-unsafe impl<T: Send> Send for Channel<T> {}
+unsafe impl<T: Send, M: Send> Send for Channel<T, M> {}
 
-unsafe impl<T> Sync for Channel<T> {}
+unsafe impl<T, M> Sync for Channel<T, M> {}
 
-impl<T> Channel<T> {
+impl<T, M> Channel<T, M> {
     /// Allocates a new `Channel` on the heap.
     ///
     /// `capacity` must small enough to ensure each slot has 2 bits for the
@@ -952,7 +974,7 @@ impl<T> Channel<T> {
     /// is 29.
     ///
     /// Marks a single [`Receiver`] and [`Sender`] as alive.
-    fn new(capacity: usize) -> NonNull<Channel<T>> {
+    fn new(capacity: usize, metadata: M) -> NonNull<Channel<T, M>> {
         assert!(capacity >= MIN_CAP, "capacity can't be zero");
         assert!(capacity <= MAX_CAP, "capacity too large");
 
@@ -960,14 +982,14 @@ impl<T> Channel<T> {
         // Safety: returns an error on arithmetic overflow, but it should be OK
         // with a capacity <= MAX_CAP.
         let (layout, _) = Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity)
-            .and_then(|slots_layout| Layout::new::<Inner>().extend(slots_layout))
+            .and_then(|slots_layout| Layout::new::<Inner<M>>().extend(slots_layout))
             .unwrap();
         // Safety: we check if the allocation is successful.
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             handle_alloc_error(layout);
         }
-        let ptr = ptr::slice_from_raw_parts_mut(ptr as *mut T, capacity) as *mut Channel<T>;
+        let ptr = ptr::slice_from_raw_parts_mut(ptr as *mut T, capacity) as *mut Channel<T, M>;
 
         // Initialise all fields (that need it).
         unsafe {
@@ -978,6 +1000,7 @@ impl<T> Channel<T> {
             ptr::addr_of_mut!((*ptr).inner.sender_wakers).write(const_mutex(Vec::new()));
             ptr::addr_of_mut!((*ptr).inner.join_wakers).write(const_mutex(Vec::new()));
             ptr::addr_of_mut!((*ptr).inner.receiver_waker).write(WakerRegistration::new());
+            ptr::addr_of_mut!((*ptr).inner.metadata).write(metadata);
         }
 
         // Safety: checked if the pointer is null above.
@@ -1012,15 +1035,15 @@ impl<T> Channel<T> {
 
 // NOTE: this is here so we don't have to type `self.channel().inner`
 // everywhere.
-impl<T> Deref for Channel<T> {
-    type Target = Inner;
+impl<T, M> Deref for Channel<T, M> {
+    type Target = Inner<M>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<T> fmt::Debug for Channel<T> {
+impl<T, M> fmt::Debug for Channel<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = self.status.load(Ordering::Relaxed);
         let ref_count = self.ref_count.load(Ordering::Relaxed);
@@ -1041,7 +1064,7 @@ impl<T> fmt::Debug for Channel<T> {
     }
 }
 
-impl<T> Drop for Channel<T> {
+impl<T, M> Drop for Channel<T, M> {
     fn drop(&mut self) {
         // Safety: we have unique access, per the mutable reference, so relaxed
         // is fine.
@@ -1064,8 +1087,8 @@ impl<T> Drop for Channel<T> {
 /// crashes, and to restart the actor we need another `Receiver`. Using the
 /// manager a new `Receiver` can be created, ensuring only a single `Receiver`
 /// is alive at any given time.
-pub struct Manager<T> {
-    channel: NonNull<Channel<T>>,
+pub struct Manager<T, M = ()> {
+    channel: NonNull<Channel<T, M>>,
 }
 
 /// Error returned by [`Manager::new_receiver`] if a receiver is already
@@ -1093,7 +1116,19 @@ impl<T> Manager<T> {
     ///
     /// Same as [`new`] but with a `Manager`.
     pub fn new_channel(capacity: usize) -> (Manager<T>, Sender<T>, Receiver<T>) {
-        let (sender, receiver) = new(capacity);
+        Manager::new_channel_with_metadata(capacity, ())
+    }
+}
+
+impl<T, M> Manager<T, M> {
+    /// Create a bounded channel with a `Manager` and `metadata`.
+    ///
+    /// Same as [`new_with_metadata`] but with a `Manager`.
+    pub fn new_channel_with_metadata(
+        capacity: usize,
+        metadata: M,
+    ) -> (Manager<T, M>, Sender<T, M>, Receiver<T, M>) {
+        let (sender, receiver) = new_with_metadata(capacity, metadata);
         let old_count = sender
             .channel()
             .ref_count
@@ -1113,7 +1148,7 @@ impl<T> Manager<T> {
     /// conditions apply here.
     ///
     /// [safety nodes]: struct.Sender.html#impl-Clone
-    pub fn new_sender(&self) -> Sender<T> {
+    pub fn new_sender(&self) -> Sender<T, M> {
         // For the reasoning behind this relaxed ordering see `Arc::clone`.
         let old_ref_count = self.channel().ref_count.fetch_add(1, Ordering::Relaxed);
         if old_ref_count & SENDER_ACCESS != 0 {
@@ -1130,7 +1165,7 @@ impl<T> Manager<T> {
     /// Attempt to create a new [`Receiver`].
     ///
     /// This will fail if there already is a receiver.
-    pub fn new_receiver(&self) -> Result<Receiver<T>, ReceiverConnected> {
+    pub fn new_receiver(&self) -> Result<Receiver<T, M>, ReceiverConnected> {
         let old_count = self
             .channel()
             .ref_count
@@ -1146,12 +1181,17 @@ impl<T> Manager<T> {
         }
     }
 
-    fn channel(&self) -> &Channel<T> {
+    /// Returns a reference to the metadata of the channel.
+    pub fn metadata(&self) -> &M {
+        &self.channel().metadata
+    }
+
+    fn channel(&self) -> &Channel<T, M> {
         unsafe { self.channel.as_ref() }
     }
 }
 
-impl<T> fmt::Debug for Manager<T> {
+impl<T, M> fmt::Debug for Manager<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Manager")
             .field("channel", &self.channel())
@@ -1160,13 +1200,13 @@ impl<T> fmt::Debug for Manager<T> {
 }
 
 // Safety: if the value can be send across thread than so can the channel.
-unsafe impl<T: Send> Send for Manager<T> {}
+unsafe impl<T: Send, M: Send> Send for Manager<T, M> {}
 
-unsafe impl<T> Sync for Manager<T> {}
+unsafe impl<T, M> Sync for Manager<T, M> {}
 
-impl<T> Unpin for Manager<T> {}
+impl<T, M> Unpin for Manager<T, M> {}
 
-impl<T> Drop for Manager<T> {
+impl<T, M> Drop for Manager<T, M> {
     #[rustfmt::skip]
     fn drop(&mut self) {
         // First mark the manager as dropped.
