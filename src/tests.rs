@@ -51,7 +51,7 @@ fn new_count_waker() -> (task::Waker, AwokenCount) {
 
 #[test]
 fn size_assertions() {
-    let channel = unsafe { Box::from_raw(Channel::<()>::new(1).as_ptr()) };
+    let channel = unsafe { Box::from_raw(Channel::<(), ()>::new(1, ()).as_ptr()) };
     assert_eq!(size_of_val(&**channel), 112);
     assert_eq!(size_of::<Sender<()>>(), 16);
     assert_eq!(size_of::<Receiver<()>>(), 16);
@@ -208,8 +208,8 @@ fn test_receiver_pos() {
     }
 }
 
-fn test_channel() -> Box<Channel<usize>> {
-    unsafe { Box::from_raw(Channel::new(SMALL_CAP).as_ptr()) }
+fn test_channel() -> Box<Channel<usize, ()>> {
+    unsafe { Box::from_raw(Channel::new(SMALL_CAP, ()).as_ptr()) }
 }
 
 #[test]
