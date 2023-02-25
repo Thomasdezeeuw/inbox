@@ -1,5 +1,7 @@
 # Inbox
 
+heph-inbox has been merged into the main Heph repo: <https://github.com/Thomasdezeeuw/heph>.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Crates.io](https://img.shields.io/crates/v/heph-inbox.svg)](https://crates.io/crates/heph-inbox)
 [![Docs](https://docs.rs/heph-inbox/badge.svg)](https://docs.rs/heph-inbox)
